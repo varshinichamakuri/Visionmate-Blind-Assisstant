@@ -15,20 +15,11 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Being Your Shravann"
+        android:text="@string/app_tagline"
         android:layout_marginTop="10dp"
         android:fontFamily="sans-serif-black"
         android:textColor="#2470ED"
-        android:textSize="26sp"
-        android:textAlignment="center"/>
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="By Pavitra Sharma"
-        android:layout_marginTop="10dp"
-        android:fontFamily="sans-serif-medium"
-        android:textColor="#2470ED"
-        android:textSize="22sp"
+        android:textSize="24sp"
         android:textAlignment="center"/>
 
 </LinearLayout>

@@ -89,12 +89,13 @@ public class MultiBoxTracker {
     boxPaint.setStrokeJoin(Join.ROUND);
     boxPaint.setStrokeMiter(100);
 
-    textToSpeech = new TextToSpeech(context.getApplicationContext(), new TextToSpeech.OnInitListener() {
-      @Override
-      public void onInit(int i) {
-        if(i != TextToSpeech.ERROR){
+    textToSpeech = new TextToSpeech(context.getApplicationContext(), i -> {
+      switch (i) {
+        case TextToSpeech.SUCCESS:
           textToSpeech.setLanguage(Locale.US);
-        }
+          break;
+        default:
+          break;
       }
     });
 
@@ -195,6 +196,7 @@ public class MultiBoxTracker {
               queue.poll();
           }
           queue.add(result.getTitle());
+        textToSpeech.setSpeechRate(1.2f);
         textToSpeech.speak(result.getTitle() + " is detected !", TextToSpeech.QUEUE_ADD, null);
       }
 

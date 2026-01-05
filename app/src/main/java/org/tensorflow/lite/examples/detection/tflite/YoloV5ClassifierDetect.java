@@ -26,6 +26,7 @@ import org.tensorflow.lite.Tensor;
 import org.tensorflow.lite.examples.detection.MainActivity;
 import org.tensorflow.lite.examples.detection.env.Logger;
 import org.tensorflow.lite.examples.detection.env.Utils;
+import org.tensorflow.lite.gpu.CompatibilityList;
 import org.tensorflow.lite.gpu.GpuDelegate;
 import org.tensorflow.lite.nnapi.NnApiDelegate;
 
@@ -97,18 +98,20 @@ public class YoloV5ClassifierDetect implements Classifier {
                     d.nnapiDelegate = new NnApiDelegate();
                     options.addDelegate(d.nnapiDelegate);
                     options.setNumThreads(NUM_THREADS);
-//                    options.setUseNNAPI(false);
-//                    options.setAllowFp16PrecisionForFp32(true);
-//                    options.setAllowBufferHandleOutput(true);
                     options.setUseNNAPI(true);
                 }
             }
             if (isGPU) {
-                GpuDelegate.Options gpu_options = new GpuDelegate.Options();
-                gpu_options.setPrecisionLossAllowed(true); // It seems that the default is true
-                gpu_options.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED);
-                d.gpuDelegate = new GpuDelegate(gpu_options);
-                options.addDelegate(d.gpuDelegate);
+                try (CompatibilityList compatList = new CompatibilityList()) {
+                    if(compatList.isDelegateSupportedOnThisDevice()){
+                        // if the device has a supported GPU, add the GPU delegate
+                        GpuDelegate gpuDelegate = new GpuDelegate();
+                        options.addDelegate(gpuDelegate);
+                    } else {
+                        // if the GPU is not supported, run on 4 threads
+                        options.setNumThreads(4);
+                    }
+                }
             }
             d.tfliteModel = Utils.loadModelFile(assetManager, modelFilename);
             d.tfLite = new Interpreter(d.tfliteModel, options);
@@ -172,8 +175,10 @@ public class YoloV5ClassifierDetect implements Classifier {
 
     @Override
     public void close() {
-        tfLite.close();
-        tfLite = null;
+        if (tfLite != null) {
+            tfLite.close();
+            tfLite = null;
+        }
         if (gpuDelegate != null) {
             gpuDelegate.close();
             gpuDelegate = null;
@@ -186,12 +191,18 @@ public class YoloV5ClassifierDetect implements Classifier {
     }
 
     public void setNumThreads(int num_threads) {
-        if (tfLite != null) tfLite.setNumThreads(num_threads);
+        if (tfLite != null) {
+            tfliteOptions.setNumThreads(num_threads);
+            recreateInterpreter();
+        }
     }
 
     @Override
     public void setUseNNAPI(boolean isChecked) {
-//        if (tfLite != null) tfLite.setUseNNAPI(isChecked);
+        if (tfLite != null) {
+            tfliteOptions.setUseNNAPI(isChecked);
+            recreateInterpreter();
+        }
     }
 
     private void recreateInterpreter() {
@@ -245,7 +256,7 @@ public class YoloV5ClassifierDetect implements Classifier {
     // Number of threads in the java app
     private static final int NUM_THREADS = 1;
     private static boolean isNNAPI = false;
-    private static boolean isGPU = false;
+    private static boolean isGPU = true;
 
     private boolean isModelQuantized;
 

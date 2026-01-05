@@ -26,6 +26,7 @@ import org.tensorflow.lite.Tensor;
 import org.tensorflow.lite.examples.detection.MainActivity;
 import org.tensorflow.lite.examples.detection.env.Logger;
 import org.tensorflow.lite.examples.detection.env.Utils;
+import org.tensorflow.lite.gpu.CompatibilityList;
 import org.tensorflow.lite.gpu.GpuDelegate;
 import org.tensorflow.lite.nnapi.NnApiDelegate;
 
@@ -95,18 +96,20 @@ public class YoloV5Classifier implements Classifier {
                     d.nnapiDelegate = new NnApiDelegate();
                     options.addDelegate(d.nnapiDelegate);
                     options.setNumThreads(NUM_THREADS);
-//                    options.setUseNNAPI(false);
-//                    options.setAllowFp16PrecisionForFp32(true);
-//                    options.setAllowBufferHandleOutput(true);
                     options.setUseNNAPI(true);
                 }
             }
             if (isGPU) {
-                GpuDelegate.Options gpu_options = new GpuDelegate.Options();
-                gpu_options.setPrecisionLossAllowed(true); // It seems that the default is true
-                gpu_options.setInferencePreference(GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED);
-                d.gpuDelegate = new GpuDelegate(gpu_options);
-                options.addDelegate(d.gpuDelegate);
+                try (CompatibilityList compatList = new CompatibilityList()) {
+                    if(compatList.isDelegateSupportedOnThisDevice()){
+                        // if the device has a supported GPU, add the GPU delegate
+                        GpuDelegate gpuDelegate = new GpuDelegate();
+                        options.addDelegate(gpuDelegate);
+                    } else {
+                        // if the GPU is not supported, run on 4 threads
+                        options.setNumThreads(4);
+                    }
+                }
             }
             d.tfliteModel = Utils.loadModelFile(assetManager, modelFilename);
             d.tfLite = new Interpreter(d.tfliteModel, options);
@@ -123,14 +126,11 @@ public class YoloV5Classifier implements Classifier {
             numBytesPerChannel = 4; // Floating point
         }
         d.INPUT_SIZE = inputSize;
-        d.imgData = ByteBuffer.allocateDirect(1 * d.INPUT_SIZE * d.INPUT_SIZE * 3 * numBytesPerChannel);
+        d.imgData = ByteBuffer.allocateDirect(d.INPUT_SIZE * d.INPUT_SIZE * 3 * numBytesPerChannel);
         d.imgData.order(ByteOrder.nativeOrder());
         d.intValues = new int[d.INPUT_SIZE * d.INPUT_SIZE];
 
-        d.output_box = (int) ((Math.pow((inputSize / 32), 2) + Math.pow((inputSize / 16), 2) + Math.pow((inputSize / 8), 2)) * 3);
-//        d.OUTPUT_WIDTH = output_width;
-//        d.MASKS = masks;
-//        d.ANCHORS = anchors;
+        d.output_box = (int) ((Math.pow((inputSize / 32.0), 2) + Math.pow((inputSize / 16.0), 2) + Math.pow((inputSize / 8.0), 2)) * 3);
         if (d.isModelQuantized){
             Tensor inpten = d.tfLite.getInputTensor(0);
             d.inp_scale = inpten.quantizationParams().getScale();
@@ -176,12 +176,18 @@ public class YoloV5Classifier implements Classifier {
     }
 
     public void setNumThreads(int num_threads) {
-        if (tfLite != null) tfLite.setNumThreads(num_threads);
+        if (tfLite != null) {
+            tfliteOptions.setNumThreads(num_threads);
+            recreateInterpreter();
+        }
     }
 
     @Override
     public void setUseNNAPI(boolean isChecked) {
-//        if (tfLite != null) tfLite.setUseNNAPI(isChecked);
+        if (tfLite != null) {
+            tfliteOptions.setUseNNAPI(isChecked);
+            recreateInterpreter();
+        }
     }
 
     private void recreateInterpreter() {
@@ -211,7 +217,7 @@ public class YoloV5Classifier implements Classifier {
 
     @Override
     public float getObjThresh() {
-        return MainActivity.MINIMUM_CONFIDENCE_TF_OD_API;
+        return 0.7f;
     }
 
     private static final Logger LOGGER = new Logger();
@@ -224,14 +230,7 @@ public class YoloV5Classifier implements Classifier {
     //config yolo
     private int INPUT_SIZE = -1;
 
-//    private int[] OUTPUT_WIDTH;
-//    private int[][] MASKS;
-//    private int[] ANCHORS;
     private  int output_box;
-
-    private static final float[] XYSCALE = new float[]{1.2f, 1.1f, 1.05f};
-
-    private static final int NUM_BOXES_PER_BLOCK = 3;
 
     // Number of threads in the java app
     private static final int NUM_THREADS = 1;
@@ -254,7 +253,7 @@ public class YoloV5Classifier implements Classifier {
     // Config values.
 
     // Pre-allocated buffers.
-    private Vector<String> labels = new Vector<String>();
+    private final Vector<String> labels = new Vector<>();
     private int[] intValues;
 
     private ByteBuffer imgData;
@@ -271,19 +270,16 @@ public class YoloV5Classifier implements Classifier {
 
     //non maximum suppression
     protected ArrayList<Recognition> nms(ArrayList<Recognition> list) {
-        ArrayList<Recognition> nmsList = new ArrayList<Recognition>();
+        ArrayList<Recognition> nmsList = new ArrayList<>();
 
         for (int k = 0; k < labels.size(); k++) {
             //1.find max confidence per class
             PriorityQueue<Recognition> pq =
-                    new PriorityQueue<Recognition>(
+                    new PriorityQueue<>(
                             50,
-                            new Comparator<Recognition>() {
-                                @Override
-                                public int compare(final Recognition lhs, final Recognition rhs) {
-                                    // Intentionally reversed to put high confidence at the head of the queue.
-                                    return Float.compare(rhs.getConfidence(), lhs.getConfidence());
-                                }
+                            (Comparator<Recognition>) (lhs, rhs) -> {
+                                // Intentionally reversed to put high confidence at the head of the queue.
+                                return Float.compare(rhs.getConfidence(), lhs.getConfidence());
                             });
 
             for (int i = 0; i < list.size(); ++i) {
@@ -293,7 +289,7 @@ public class YoloV5Classifier implements Classifier {
             }
 
             //2.do non maximum suppression
-            while (pq.size() > 0) {
+            while (!pq.isEmpty()) {
                 //insert detection with max confidence
                 Recognition[] a = new Recognition[pq.size()];
                 Recognition[] detections = pq.toArray(a);
@@ -325,38 +321,29 @@ public class YoloV5Classifier implements Classifier {
         float h = overlap((a.top + a.bottom) / 2, a.bottom - a.top,
                 (b.top + b.bottom) / 2, b.bottom - b.top);
         if (w < 0 || h < 0) return 0;
-        float area = w * h;
-        return area;
+        return w * h;
     }
 
     protected float box_union(RectF a, RectF b) {
         float i = box_intersection(a, b);
-        float u = (a.right - a.left) * (a.bottom - a.top) + (b.right - b.left) * (b.bottom - b.top) - i;
-        return u;
+        return (a.right - a.left) * (a.bottom - a.top) + (b.right - b.left) * (b.bottom - b.top) - i;
     }
 
     protected float overlap(float x1, float w1, float x2, float w2) {
         float l1 = x1 - w1 / 2;
         float l2 = x2 - w2 / 2;
-        float left = l1 > l2 ? l1 : l2;
+        float left = Math.max(l1, l2);
         float r1 = x1 + w1 / 2;
         float r2 = x2 + w2 / 2;
-        float right = r1 < r2 ? r1 : r2;
+        float right = Math.min(r1, r2);
         return right - left;
     }
-
-    protected static final int BATCH_SIZE = 1;
-    protected static final int PIXEL_SIZE = 3;
 
     /**
      * Writes Image data into a {@code ByteBuffer}.
      */
     protected ByteBuffer convertBitmapToByteBuffer(Bitmap bitmap) {
-//        ByteBuffer byteBuffer = ByteBuffer.allocateDirect(4 * BATCH_SIZE * INPUT_SIZE * INPUT_SIZE * PIXEL_SIZE);
-//        byteBuffer.order(ByteOrder.nativeOrder());
-//        int[] intValues = new int[INPUT_SIZE * INPUT_SIZE];
         bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
-        int pixel = 0;
 
         imgData.rewind();
         for (int i = 0; i < INPUT_SIZE; ++i) {
@@ -378,11 +365,10 @@ public class YoloV5Classifier implements Classifier {
     }
 
     public ArrayList<Recognition> recognizeImage(Bitmap bitmap) {
-        ByteBuffer byteBuffer_ = convertBitmapToByteBuffer(bitmap);
+        convertBitmapToByteBuffer(bitmap);
 
         Map<Integer, Object> outputMap = new HashMap<>();
 
-//        float[][][] outbuf = new float[1][output_box][labels.size() + 5];
         outData.rewind();
         outputMap.put(0, outData);
         Log.d("YoloV5Classifier", "mObjThresh: " + getObjThresh());
@@ -393,7 +379,7 @@ public class YoloV5Classifier implements Classifier {
         ByteBuffer byteBuffer = (ByteBuffer) outputMap.get(0);
         byteBuffer.rewind();
 
-        ArrayList<Recognition> detections = new ArrayList<Recognition>();
+        ArrayList<Recognition> detections = new ArrayList<>();
 
         float[][][] out = new float[1][output_box][numClass + 5];
         Log.d("YoloV5Classifier", "out[0] detect start");
@@ -418,9 +404,7 @@ public class YoloV5Classifier implements Classifier {
             float maxClass = 0;
 
             final float[] classes = new float[labels.size()];
-            for (int c = 0; c < labels.size(); ++c) {
-                classes[c] = out[0][i][5 + c];
-            }
+            System.arraycopy(out[0][i], 5, classes, 0, labels.size());
 
             for (int c = 0; c < labels.size(); ++c) {
                 if (classes[c] > maxClass) {
@@ -451,60 +435,32 @@ public class YoloV5Classifier implements Classifier {
         }
 
         Log.d("YoloV5Classifier", "detect end");
-        final ArrayList<Recognition> recognitions = nms(detections);
-//        final ArrayList<Recognition> recognitions = detections;
-        return recognitions;
+        return nms(detections);
     }
 
-    public boolean checkInvalidateBox(float x, float y, float width, float height, float oriW, float oriH, int intputSize) {
-        // (1) (x, y, w, h) --> (xmin, ymin, xmax, ymax)
-        float halfHeight = height / 2.0f;
-        float halfWidth = width / 2.0f;
-
-        float[] pred_coor = new float[]{x - halfWidth, y - halfHeight, x + halfWidth, y + halfHeight};
-
+    public float[] restore_box(float[] pred_coor, float oriW, float oriH, int intputSize) {
         // (2) (xmin, ymin, xmax, ymax) -> (xmin_org, ymin_org, xmax_org, ymax_org)
-        float resize_ratioW = 1.0f * intputSize / oriW;
-        float resize_ratioH = 1.0f * intputSize / oriH;
+        float resize_ratioW = (float) (1.0 * intputSize / oriW);
+        float resize_ratioH = (float) (1.0 * intputSize / oriH);
 
-        float resize_ratio = resize_ratioW > resize_ratioH ? resize_ratioH : resize_ratioW; //min
+        float resize_ratio = Math.min(resize_ratioW, resize_ratioH);
 
         float dw = (intputSize - resize_ratio * oriW) / 2;
         float dh = (intputSize - resize_ratio * oriH) / 2;
 
-        pred_coor[0] = 1.0f * (pred_coor[0] - dw) / resize_ratio;
-        pred_coor[2] = 1.0f * (pred_coor[2] - dw) / resize_ratio;
+        pred_coor[0] = (pred_coor[0] - dw) / resize_ratio;
+        pred_coor[2] = (pred_coor[2] - dw) / resize_ratio;
 
-        pred_coor[1] = 1.0f * (pred_coor[1] - dh) / resize_ratio;
-        pred_coor[3] = 1.0f * (pred_coor[3] - dh) / resize_ratio;
+        pred_coor[1] = (pred_coor[1] - dh) / resize_ratio;
+        pred_coor[3] = (pred_coor[3] - dh) / resize_ratio;
 
         // (3) clip some boxes those are out of range
-        pred_coor[0] = pred_coor[0] > 0 ? pred_coor[0] : 0;
-        pred_coor[1] = pred_coor[1] > 0 ? pred_coor[1] : 0;
+        pred_coor[0] = Math.max(0, pred_coor[0]);
+        pred_coor[1] = Math.max(0, pred_coor[1]);
 
-        pred_coor[2] = pred_coor[2] < (oriW - 1) ? pred_coor[2] : (oriW - 1);
-        pred_coor[3] = pred_coor[3] < (oriH - 1) ? pred_coor[3] : (oriH - 1);
+        pred_coor[2] = Math.min(oriW - 1, pred_coor[2]);
+        pred_coor[3] = Math.min(oriH - 1, pred_coor[3]);
 
-        if ((pred_coor[0] > pred_coor[2]) || (pred_coor[1] > pred_coor[3])) {
-            pred_coor[0] = 0;
-            pred_coor[1] = 0;
-            pred_coor[2] = 0;
-            pred_coor[3] = 0;
-        }
-
-        // (4) discard some invalid boxes
-        float temp1 = pred_coor[2] - pred_coor[0];
-        float temp2 = pred_coor[3] - pred_coor[1];
-        float temp = temp1 * temp2;
-        if (temp < 0) {
-            Log.e("checkInvalidateBox", "temp < 0");
-            return false;
-        }
-        if (Math.sqrt(temp) > Float.MAX_VALUE) {
-            Log.e("checkInvalidateBox", "temp max");
-            return false;
-        }
-
-        return true;
+        return pred_coor;
     }
 }
