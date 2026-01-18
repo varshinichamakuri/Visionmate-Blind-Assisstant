@@ -1,6 +1,6 @@
-# Shravan: Visually Impaired Guidance Application
+# VisionMate: Visually Impaired Guidance Application
 
-Shravan is an Android application that aims to provide guidance and assistance to visually impaired individuals. It leverages object detection using TensorFlow Lite to help users detect objects in their surroundings.
+VisionMate is an Android application that aims to provide guidance and assistance to visually impaired individuals. It leverages object detection using TensorFlow Lite to help users detect objects in their surroundings.
 
 ## Features
 <!-- Add bullet points -->
