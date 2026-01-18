@@ -23,7 +23,6 @@ import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
 import org.tensorflow.lite.Tensor;
-import org.tensorflow.lite.examples.detection.MainActivity;
 import org.tensorflow.lite.examples.detection.env.Logger;
 import org.tensorflow.lite.examples.detection.env.Utils;
 import org.tensorflow.lite.gpu.CompatibilityList;
@@ -45,34 +44,14 @@ import java.util.PriorityQueue;
 import java.util.Vector;
 
 
-/**
- * Wrapper for frozen detection models trained using the Tensorflow Object Detection API:
- * - https://github.com/tensorflow/models/tree/master/research/object_detection
- * where you can find the training code.
- * <p>
- * To use pretrained models in the API or convert to TF Lite models, please see docs for details:
- * - https://github.com/tensorflow/models/blob/master/research/object_detection/g3doc/detection_model_zoo.md
- * - https://github.com/tensorflow/models/blob/master/research/object_detection/g3doc/running_on_mobile_tensorflowlite.md#running-our-model-on-android
- */
 public class YoloV5Classifier implements Classifier {
 
-    /**
-     * Initializes a native TensorFlow session for classifying images.
-     *
-     * @param assetManager  The asset manager to be used to load assets.
-     * @param modelFilename The filepath of the model GraphDef protocol buffer.
-     * @param labelFilename The filepath of label file for classes.
-     * @param isQuantized   Boolean representing model is quantized or not
-     */
     public static YoloV5Classifier create(
             final AssetManager assetManager,
             final String modelFilename,
             final String labelFilename,
             final boolean isQuantized,
-            final int inputSize
-            /*final int[] output_width,
-            final int[][] masks,
-            final int[] anchors*/)
+            final int inputSize)
             throws IOException {
         final YoloV5Classifier d = new YoloV5Classifier();
 
@@ -91,7 +70,6 @@ public class YoloV5Classifier implements Classifier {
             options.setNumThreads(NUM_THREADS);
             if (isNNAPI) {
                 d.nnapiDelegate = null;
-                // Initialize interpreter with NNAPI delegate for Android Pie or above
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     d.nnapiDelegate = new NnApiDelegate();
                     options.addDelegate(d.nnapiDelegate);
@@ -102,11 +80,9 @@ public class YoloV5Classifier implements Classifier {
             if (isGPU) {
                 try (CompatibilityList compatList = new CompatibilityList()) {
                     if(compatList.isDelegateSupportedOnThisDevice()){
-                        // if the device has a supported GPU, add the GPU delegate
                         GpuDelegate gpuDelegate = new GpuDelegate();
                         options.addDelegate(gpuDelegate);
                     } else {
-                        // if the GPU is not supported, run on 4 threads
                         options.setNumThreads(4);
                     }
                 }
@@ -118,7 +94,6 @@ public class YoloV5Classifier implements Classifier {
         }
 
         d.isModelQuantized = isQuantized;
-        // Pre-allocate buffers.
         int numBytesPerChannel;
         if (isQuantized) {
             numBytesPerChannel = 1; // Quantized
@@ -145,6 +120,10 @@ public class YoloV5Classifier implements Classifier {
         d.numClass = numClass;
         d.outData = ByteBuffer.allocateDirect(d.output_box * (numClass + 5) * numBytesPerChannel);
         d.outData.order(ByteOrder.nativeOrder());
+        
+        // Initialize object heights for distance estimation
+        d.initObjectHeights();
+        
         return d;
     }
 
@@ -162,8 +141,10 @@ public class YoloV5Classifier implements Classifier {
 
     @Override
     public void close() {
-        tfLite.close();
-        tfLite = null;
+        if (tfLite != null) {
+            tfLite.close();
+            tfLite = null;
+        }
         if (gpuDelegate != null) {
             gpuDelegate.close();
             gpuDelegate = null;
@@ -217,42 +198,30 @@ public class YoloV5Classifier implements Classifier {
 
     @Override
     public float getObjThresh() {
-        return 0.7f;
+        return 0.5f; // Standard threshold
     }
 
     private static final Logger LOGGER = new Logger();
 
-    // Float model
     private final float IMAGE_MEAN = 0;
-
     private final float IMAGE_STD = 255.0f;
 
     //config yolo
     private int INPUT_SIZE = -1;
-
     private  int output_box;
 
-    // Number of threads in the java app
     private static final int NUM_THREADS = 1;
     private static boolean isNNAPI = false;
     private static boolean isGPU = false;
 
     private boolean isModelQuantized;
 
-    /** holds a gpu delegate */
     GpuDelegate gpuDelegate = null;
-    /** holds an nnapi delegate */
     NnApiDelegate nnapiDelegate = null;
 
-    /** The loaded TensorFlow Lite model. */
     private MappedByteBuffer tfliteModel;
-
-    /** Options for configuring the Interpreter. */
     private final Interpreter.Options tfliteOptions = new Interpreter.Options();
 
-    // Config values.
-
-    // Pre-allocated buffers.
     private final Vector<String> labels = new Vector<>();
     private int[] intValues;
 
@@ -265,7 +234,52 @@ public class YoloV5Classifier implements Classifier {
     private float oup_scale;
     private int oup_zero_point;
     private int numClass;
+    
+    // Distance Estimation Map
+    private Map<String, Float> objectRealHeights = new HashMap<>();
+    // Approximate Focal Length (in pixels) for standard mobile camera at 640x640 input
+    // F ~ (ImageHeight / 2) / tan(FOV/2). Assuming ~60 deg vertical FOV.
+    private static final float FOCAL_LENGTH_PIXELS = 600.0f; 
+
     private YoloV5Classifier() {
+    }
+    
+    private void initObjectHeights() {
+        // Average heights in meters
+        objectRealHeights.put("person", 1.7f);
+        objectRealHeights.put("bicycle", 1.5f);
+        objectRealHeights.put("car", 1.5f);
+        objectRealHeights.put("motorcycle", 1.0f);
+        objectRealHeights.put("bus", 3.0f);
+        objectRealHeights.put("truck", 3.0f);
+        objectRealHeights.put("traffic light", 2.5f);
+        objectRealHeights.put("stop sign", 2.0f);
+        objectRealHeights.put("bench", 0.5f);
+        objectRealHeights.put("chair", 1.0f); // Back of chair
+        objectRealHeights.put("couch", 0.8f);
+        objectRealHeights.put("pottedplant", 0.4f);
+        objectRealHeights.put("bed", 0.6f);
+        objectRealHeights.put("diningtable", 0.75f);
+        objectRealHeights.put("toilet", 0.5f);
+        objectRealHeights.put("tvmonitor", 0.6f);
+        objectRealHeights.put("laptop", 0.3f);
+        objectRealHeights.put("mouse", 0.1f);
+        objectRealHeights.put("remote", 0.05f);
+        objectRealHeights.put("keyboard", 0.05f);
+        objectRealHeights.put("cell phone", 0.15f);
+        objectRealHeights.put("microwave", 0.4f);
+        objectRealHeights.put("oven", 0.5f);
+        objectRealHeights.put("toaster", 0.3f);
+        objectRealHeights.put("sink", 0.8f);
+        objectRealHeights.put("refrigerator", 1.7f);
+        objectRealHeights.put("book", 0.25f);
+        objectRealHeights.put("clock", 0.3f);
+        objectRealHeights.put("vase", 0.3f);
+        objectRealHeights.put("scissors", 0.1f);
+        objectRealHeights.put("teddy bear", 0.4f);
+        objectRealHeights.put("hair drier", 0.2f);
+        objectRealHeights.put("toothbrush", 0.15f);
+        objectRealHeights.put("door", 2.0f);
     }
 
     //non maximum suppression
@@ -339,9 +353,6 @@ public class YoloV5Classifier implements Classifier {
         return right - left;
     }
 
-    /**
-     * Writes Image data into a {@code ByteBuffer}.
-     */
     protected ByteBuffer convertBitmapToByteBuffer(Bitmap bitmap) {
         bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
 
@@ -350,7 +361,6 @@ public class YoloV5Classifier implements Classifier {
             for (int j = 0; j < INPUT_SIZE; ++j) {
                 int pixelValue = intValues[i * INPUT_SIZE + j];
                 if (isModelQuantized) {
-                    // Quantized model
                     imgData.put((byte) ((((pixelValue >> 16) & 0xFF) - IMAGE_MEAN) / IMAGE_STD / inp_scale + inp_zero_point));
                     imgData.put((byte) ((((pixelValue >> 8) & 0xFF) - IMAGE_MEAN) / IMAGE_STD / inp_scale + inp_zero_point));
                     imgData.put((byte) (((pixelValue & 0xFF) - IMAGE_MEAN) / IMAGE_STD / inp_scale + inp_zero_point));
@@ -371,7 +381,6 @@ public class YoloV5Classifier implements Classifier {
 
         outData.rewind();
         outputMap.put(0, outData);
-        Log.d("YoloV5Classifier", "mObjThresh: " + getObjThresh());
 
         Object[] inputArray = {imgData};
         tfLite.runForMultipleInputsOutputs(inputArray, outputMap);
@@ -382,7 +391,6 @@ public class YoloV5Classifier implements Classifier {
         ArrayList<Recognition> detections = new ArrayList<>();
 
         float[][][] out = new float[1][output_box][numClass + 5];
-        Log.d("YoloV5Classifier", "out[0] detect start");
         for (int i = 0; i < output_box; ++i) {
             for (int j = 0; j < numClass + 5; ++j) {
                 if (isModelQuantized){
@@ -420,8 +428,6 @@ public class YoloV5Classifier implements Classifier {
 
                 final float w = out[0][i][2];
                 final float h = out[0][i][3];
-                Log.d("YoloV5Classifier",
-                        Float.toString(xPos) + ',' + yPos + ',' + w + ',' + h);
 
                 final RectF rect =
                         new RectF(
@@ -429,38 +435,30 @@ public class YoloV5Classifier implements Classifier {
                                 Math.max(0, yPos - h / 2),
                                 Math.min(bitmap.getWidth() - 1, xPos + w / 2),
                                 Math.min(bitmap.getHeight() - 1, yPos + h / 2));
-                detections.add(new Recognition("" + offset, labels.get(detectedClass),
-                        confidenceInClass, rect, detectedClass));
+                
+                Recognition recognition = new Recognition("" + offset, labels.get(detectedClass),
+                        confidenceInClass, rect, detectedClass);
+                
+                // --- Distance Estimation Logic ---
+                String labelName = labels.get(detectedClass).toLowerCase();
+                if (objectRealHeights.containsKey(labelName)) {
+                    float realHeight = objectRealHeights.get(labelName);
+                    float pixelHeight = h;
+                    
+                    // Simple Pinhole Model: Distance = (RealHeight * FocalLength) / ObjectPixelHeight
+                    // Note: This assumes the object is upright and roughly filling the height. 
+                    // Pixel height is relative to the input size (e.g. 640).
+                    
+                    if (pixelHeight > 0) {
+                        float dist = (realHeight * FOCAL_LENGTH_PIXELS) / pixelHeight;
+                        recognition.setDistance(dist);
+                    }
+                }
+                
+                detections.add(recognition);
             }
         }
 
-        Log.d("YoloV5Classifier", "detect end");
         return nms(detections);
-    }
-
-    public float[] restore_box(float[] pred_coor, float oriW, float oriH, int intputSize) {
-        // (2) (xmin, ymin, xmax, ymax) -> (xmin_org, ymin_org, xmax_org, ymax_org)
-        float resize_ratioW = (float) (1.0 * intputSize / oriW);
-        float resize_ratioH = (float) (1.0 * intputSize / oriH);
-
-        float resize_ratio = Math.min(resize_ratioW, resize_ratioH);
-
-        float dw = (intputSize - resize_ratio * oriW) / 2;
-        float dh = (intputSize - resize_ratio * oriH) / 2;
-
-        pred_coor[0] = (pred_coor[0] - dw) / resize_ratio;
-        pred_coor[2] = (pred_coor[2] - dw) / resize_ratio;
-
-        pred_coor[1] = (pred_coor[1] - dh) / resize_ratio;
-        pred_coor[3] = (pred_coor[3] - dh) / resize_ratio;
-
-        // (3) clip some boxes those are out of range
-        pred_coor[0] = Math.max(0, pred_coor[0]);
-        pred_coor[1] = Math.max(0, pred_coor[1]);
-
-        pred_coor[2] = Math.min(oriW - 1, pred_coor[2]);
-        pred_coor[3] = Math.min(oriH - 1, pred_coor[3]);
-
-        return pred_coor;
     }
 }

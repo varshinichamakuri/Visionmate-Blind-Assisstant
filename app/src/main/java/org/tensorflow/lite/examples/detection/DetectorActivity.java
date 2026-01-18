@@ -1,330 +1,264 @@
-/*
- * Copyright 2019 The TensorFlow Authors. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *       http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package org.tensorflow.lite.examples.detection;
 
-import static java.lang.Thread.sleep;
-
+import android.content.Intent;
 import android.graphics.Bitmap;
-import android.graphics.Bitmap.Config;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Matrix;
-import android.graphics.Paint;
-import android.graphics.Paint.Style;
 import android.graphics.RectF;
-import android.graphics.Typeface;
-import android.media.ImageReader.OnImageAvailableListener;
+import android.media.ImageReader;
+import android.os.Bundle;
+import android.os.Handler;
 import android.os.SystemClock;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 import android.util.Size;
-import android.util.TypedValue;
 import android.widget.Toast;
 
-import java.io.IOException;
-import java.util.LinkedList;
-import java.util.List;
-
 import org.tensorflow.lite.examples.detection.customview.OverlayView;
-import org.tensorflow.lite.examples.detection.customview.OverlayView.DrawCallback;
-import org.tensorflow.lite.examples.detection.env.BorderedText;
 import org.tensorflow.lite.examples.detection.env.ImageUtils;
-import org.tensorflow.lite.examples.detection.env.Logger;
 import org.tensorflow.lite.examples.detection.tflite.Classifier;
 import org.tensorflow.lite.examples.detection.tflite.DetectorFactory;
-import org.tensorflow.lite.examples.detection.tflite.YoloV5Classifier;
 import org.tensorflow.lite.examples.detection.tracking.MultiBoxTracker;
 
-/**
- * An activity that uses a TensorFlowMultiBoxDetector and ObjectTracker to detect and then track
- * objects.
- */
-public class DetectorActivity extends CameraActivity implements OnImageAvailableListener {
-    private static final Logger LOGGER = new Logger();
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
 
-    private static final DetectorMode MODE = DetectorMode.TF_OD_API;
-    private static final float MINIMUM_CONFIDENCE_TF_OD_API = 0.7f;
-    private static final boolean MAINTAIN_ASPECT = true;
-    private static final Size DESIRED_PREVIEW_SIZE = new Size(640, 640);
-    private static final boolean SAVE_PREVIEW_BITMAP = false;
-    private static final float TEXT_SIZE_DIP = 10;
-    OverlayView trackingOverlay;
-    private Integer sensorOrientation;
+public class DetectorActivity extends CameraActivity implements ImageReader.OnImageAvailableListener {
+    private static final String TAG = "DetectorActivity";
 
-    private YoloV5Classifier detector;
-
-    private long lastProcessingTimeMs;
+    private Classifier detector;
     private Bitmap rgbFrameBitmap = null;
     private Bitmap croppedBitmap = null;
-    private Bitmap cropCopyBitmap = null;
-
     private boolean computingDetection = false;
-
-    private long timestamp = 0;
-
     private Matrix frameToCropTransform;
     private Matrix cropToFrameTransform;
-
     private MultiBoxTracker tracker;
 
-    private BorderedText borderedText;
+    private TextToSpeech textToSpeech;
+    private SpeechRecognizer speechRecognizer;
+    private boolean isListeningForStop = false;
+    private final Handler voiceHandler = new Handler();
+    private long lastSpeakTime = 0;
+    private static final long SPEAK_INTERVAL_MS = 3000;
+    private static final float MINIMUM_CONFIDENCE_TF_OD_API = 0.5f;
+    private static final Size DESIRED_PREVIEW_SIZE = new Size(640, 640);
+    private Integer sensorOrientation;
+
+    @Override
+    public synchronized void onResume() {
+        super.onResume();
+        initVoiceServices();
+    }
+
+    @Override
+    public synchronized void onPause() {
+        shutdownVoiceServices();
+        super.onPause();
+    }
+
+    private void initVoiceServices() {
+        textToSpeech = new TextToSpeech(this, status -> {
+            if (status == TextToSpeech.SUCCESS) {
+                textToSpeech.setLanguage(Locale.US);
+            }
+        });
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override
+            public void onReadyForSpeech(Bundle params) {}
+            @Override
+            public void onBeginningOfSpeech() { isListeningForStop = true; }
+            @Override
+            public void onRmsChanged(float rmsdB) {}
+            @Override
+            public void onBufferReceived(byte[] buffer) {}
+            @Override
+            public void onEndOfSpeech() { isListeningForStop = false; }
+            @Override
+            public void onError(int error) {
+                isListeningForStop = false;
+                if (!isFinishing()) startStopListener();
+            }
+            @Override
+            public void onResults(Bundle results) {
+                isListeningForStop = false;
+                ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (matches != null) {
+                    for (String match : matches) {
+                        String cmd = match.toLowerCase();
+                        if (cmd.contains("help") || cmd.contains("मदद") || cmd.contains("సహాయం")) {
+                            fireEmergencyIntent();
+                            return;
+                        }
+                        if (cmd.contains("stop") || cmd.contains("बंद") || cmd.contains("ఆపు")) {
+                            stopDetection();
+                            return;
+                        }
+                    }
+                }
+                if (!isFinishing()) startStopListener();
+            }
+            @Override
+            public void onPartialResults(Bundle partialResults) {}
+            @Override
+            public void onEvent(int eventType, Bundle params) {}
+        });
+        startStopListener();
+    }
+
+    private void shutdownVoiceServices() {
+        if (textToSpeech != null) {
+            textToSpeech.stop();
+            textToSpeech.shutdown();
+        }
+        if (speechRecognizer != null) {
+            speechRecognizer.destroy();
+        }
+        voiceHandler.removeCallbacksAndMessages(null);
+    }
+
+    private void startStopListener() {
+        if (!isListeningForStop && !isFinishing()) {
+            isListeningForStop = true;
+            voiceHandler.post(() -> {
+                try {
+                    Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                    intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                    speechRecognizer.startListening(intent);
+                } catch (Exception e) {
+                    isListeningForStop = false;
+                    Log.e(TAG, "Failed to start stop listener", e);
+                }
+            });
+        }
+    }
+
+    private void fireEmergencyIntent() {
+        Intent intent = new Intent(this, HomeActivity.class);
+        intent.setAction(HomeActivity.ACTION_EMERGENCY);
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(intent);
+        finish();
+    }
+
+    private void stopDetection() {
+        if (textToSpeech != null) {
+            textToSpeech.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                @Override public void onStart(String utteranceId) {}
+                @Override public void onDone(String utteranceId) { finish(); }
+                @Override public void onError(String utteranceId) { finish(); }
+            });
+            textToSpeech.speak("Stopping detection", TextToSpeech.QUEUE_FLUSH, null, "StopId");
+        } else {
+            finish();
+        }
+    }
 
     @Override
     public void onPreviewSizeChosen(final Size size, final int rotation) {
-        final float textSizePx =
-                TypedValue.applyDimension(
-                        TypedValue.COMPLEX_UNIT_DIP, TEXT_SIZE_DIP, getResources().getDisplayMetrics());
-        borderedText = new BorderedText(textSizePx);
-        borderedText.setTypeface(Typeface.MONOSPACE);
-
-        tracker = new MultiBoxTracker(this);
-
-        final int modelIndex = modelView.getCheckedItemPosition();
-        final String modelString = modelStrings.get(modelIndex);
-
         try {
-            detector = DetectorFactory.getDetector(getAssets(), modelString);
+            detector = DetectorFactory.getDetector(getAssets(), "yolov5s.tflite");
         } catch (final IOException e) {
             e.printStackTrace();
-            LOGGER.e(e, "Exception initializing classifier!");
-            Toast toast =
-                    Toast.makeText(
-                            getApplicationContext(), "Classifier could not be initialized", Toast.LENGTH_SHORT);
-            toast.show();
+            Toast.makeText(getApplicationContext(), "Classifier could not be initialized.", Toast.LENGTH_SHORT).show();
             finish();
+            return;
         }
-
         int cropSize = detector.getInputSize();
-
         previewWidth = size.getWidth();
         previewHeight = size.getHeight();
-
         sensorOrientation = rotation - getScreenOrientation();
-        LOGGER.i("Camera orientation relative to screen canvas: %d", sensorOrientation);
-
-        LOGGER.i("Initializing at size %dx%d", previewWidth, previewHeight);
-        rgbFrameBitmap = Bitmap.createBitmap(previewWidth, previewHeight, Config.ARGB_8888);
-        croppedBitmap = Bitmap.createBitmap(cropSize, cropSize, Config.ARGB_8888);
-
-        frameToCropTransform =
-                ImageUtils.getTransformationMatrix(
-                        previewWidth, previewHeight,
-                        cropSize, cropSize,
-                        sensorOrientation, MAINTAIN_ASPECT);
-
+        rgbFrameBitmap = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888);
+        croppedBitmap = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888);
+        frameToCropTransform = ImageUtils.getTransformationMatrix(previewWidth, previewHeight, cropSize, cropSize, sensorOrientation, true);
         cropToFrameTransform = new Matrix();
         frameToCropTransform.invert(cropToFrameTransform);
-
-        trackingOverlay = (OverlayView) findViewById(R.id.tracking_overlay);
+        tracker = new MultiBoxTracker(this);
+        
+        OverlayView trackingOverlay = findViewById(R.id.tracking_overlay);
         trackingOverlay.addCallback(
-                new DrawCallback() {
-                    @Override
-                    public void drawCallback(final Canvas canvas) {
-                        tracker.draw(canvas);
-                        if (isDebug()) {
-                            tracker.drawDebug(canvas);
-                        }
-                    }
+                canvas -> {
+                    tracker.draw(canvas);
                 });
 
         tracker.setFrameConfiguration(previewWidth, previewHeight, sensorOrientation);
     }
 
-    protected void updateActiveModel() {
-        // Get UI information before delegating to background
-        final int modelIndex = modelView.getCheckedItemPosition();
-        final int deviceIndex = deviceView.getCheckedItemPosition();
-        String threads = threadsTextView.getText().toString().trim();
-        final int numThreads = Integer.parseInt(threads);
-
-        handler.post(() -> {
-            if (modelIndex == currentModel && deviceIndex == currentDevice
-                    && numThreads == currentNumThreads) {
-                return;
-            }
-            currentModel = modelIndex;
-            currentDevice = deviceIndex;
-            currentNumThreads = numThreads;
-
-            // Disable classifier while updating
-            if (detector != null) {
-                detector.close();
-                detector = null;
-            }
-
-            // Lookup names of parameters.
-            String modelString = modelStrings.get(modelIndex);
-            String device = deviceStrings.get(deviceIndex);
-
-            LOGGER.i("Changing model to " + modelString + " device " + device);
-
-            // Try to load model.
-
-            try {
-                detector = DetectorFactory.getDetector(getAssets(), modelString);
-                // Customize the interpreter to the type of device we want to use.
-                if (detector == null) {
-                    return;
-                }
-            }
-            catch(IOException e) {
-                e.printStackTrace();
-                LOGGER.e(e, "Exception in updateActiveModel()");
-                Toast toast =
-                        Toast.makeText(
-                                getApplicationContext(), "Classifier could not be initialized", Toast.LENGTH_SHORT);
-                toast.show();
-                finish();
-            }
-
-
-            if (device.equals("CPU")) {
-                detector.useCPU();
-            } else if (device.equals("GPU")) {
-                detector.useGpu();
-            } else if (device.equals("NNAPI")) {
-                detector.useNNAPI();
-            }
-            detector.setNumThreads(numThreads);
-
-            int cropSize = detector.getInputSize();
-            croppedBitmap = Bitmap.createBitmap(cropSize, cropSize, Config.ARGB_8888);
-
-            frameToCropTransform =
-                    ImageUtils.getTransformationMatrix(
-                            previewWidth, previewHeight,
-                            cropSize, cropSize,
-                            sensorOrientation, MAINTAIN_ASPECT);
-
-            cropToFrameTransform = new Matrix();
-            frameToCropTransform.invert(cropToFrameTransform);
-        });
-    }
-
     @Override
     protected void processImage() {
-        ++timestamp;
-        final long currTimestamp = timestamp;
-        trackingOverlay.postInvalidate();
-
-        // No mutex needed as this method is not reentrant.
-        if (computingDetection) {
+        if (computingDetection || rgbFrameBitmap == null) {
             readyForNextImage();
             return;
         }
         computingDetection = true;
-        LOGGER.i("Preparing image " + currTimestamp + " for detection in bg thread.");
-
         rgbFrameBitmap.setPixels(getRgbBytes(), 0, previewWidth, 0, 0, previewWidth, previewHeight);
-
         readyForNextImage();
 
         final Canvas canvas = new Canvas(croppedBitmap);
         canvas.drawBitmap(rgbFrameBitmap, frameToCropTransform, null);
-        // For examining the actual TF input.
-        if (SAVE_PREVIEW_BITMAP) {
-            ImageUtils.saveBitmap(croppedBitmap);
-        }
 
-        runInBackground(
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        LOGGER.i("Running detection on image " + currTimestamp);
-                        final long startTime = SystemClock.uptimeMillis();
-                        final List<Classifier.Recognition> results = detector.recognizeImage(croppedBitmap);
-                        lastProcessingTimeMs = SystemClock.uptimeMillis() - startTime;
+        runInBackground(() -> {
+            try {
+                final List<Classifier.Recognition> results = detector.recognizeImage(croppedBitmap);
+                final List<Classifier.Recognition> mappedRecognitions = new LinkedList<>();
+                Classifier.Recognition bestMatch = null;
 
-                        Log.e("CHECK", "run: " + results.size());
-
-                        cropCopyBitmap = Bitmap.createBitmap(croppedBitmap);
-                        final Canvas canvas = new Canvas(cropCopyBitmap);
-                        final Paint paint = new Paint();
-                        paint.setColor(Color.RED);
-                        paint.setStyle(Style.STROKE);
-                        paint.setStrokeWidth(2.0f);
-
-                        float minimumConfidence = MINIMUM_CONFIDENCE_TF_OD_API;
-                        switch (MODE) {
-                            case TF_OD_API:
-                                minimumConfidence = MINIMUM_CONFIDENCE_TF_OD_API;
-                                break;
-                        }
-
-                        final List<Classifier.Recognition> mappedRecognitions =
-                                new LinkedList<Classifier.Recognition>();
-
-                        for (final Classifier.Recognition result : results) {
-                            final RectF location = result.getLocation();
-                            if (location != null && result.getConfidence() >= minimumConfidence) {
-                                canvas.drawRect(location, paint);
-
-                                cropToFrameTransform.mapRect(location);
-
-                                result.setLocation(location);
-                                mappedRecognitions.add(result);
+                for (final Classifier.Recognition result : results) {
+                    final RectF location = result.getLocation();
+                    if (location != null && result.getConfidence() >= MINIMUM_CONFIDENCE_TF_OD_API) {
+                        cropToFrameTransform.mapRect(location);
+                        result.setLocation(location);
+                        mappedRecognitions.add(result);
+                        if (result.getDistance() != null) {
+                            if (bestMatch == null || result.getDistance() < bestMatch.getDistance()) {
+                                bestMatch = result;
                             }
                         }
-
-                        tracker.trackResults(mappedRecognitions, currTimestamp);
-                        try {
-                            sleep(1000);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                        }
-                        trackingOverlay.postInvalidate();
-
-                        computingDetection = false;
-
-                        runOnUiThread(
-                                new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        showFrameInfo(previewWidth + "x" + previewHeight);
-                                        showCropInfo(cropCopyBitmap.getWidth() + "x" + cropCopyBitmap.getHeight());
-                                        showInference(lastProcessingTimeMs + "ms");
-                                    }
-                                });
                     }
-                });
+                }
+                tracker.trackResults(mappedRecognitions, System.currentTimeMillis());
+                if (bestMatch != null) {
+                    final Classifier.Recognition finalBestMatch = bestMatch;
+                    runOnUiThread(() -> announceObject(finalBestMatch));
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Exception in detection background thread!", e);
+            }
+            computingDetection = false;
+        });
+    }
+
+    private void announceObject(Classifier.Recognition recognition) {
+        long currentTime = System.currentTimeMillis();
+        if (textToSpeech != null && !textToSpeech.isSpeaking() && (currentTime - lastSpeakTime > SPEAK_INTERVAL_MS)) {
+            String message = recognition.getTitle() + ", " + String.format(Locale.US, "%.1f meters", recognition.getDistance());
+            textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, null);
+            lastSpeakTime = currentTime;
+        }
     }
 
     @Override
-    protected int getLayoutId() {
-        return R.layout.tfe_od_camera_connection_fragment_tracking;
-    }
-
+    protected int getLayoutId() { return R.layout.tfe_od_camera_connection_fragment_tracking; }
     @Override
-    protected Size getDesiredPreviewFrameSize() {
-        return DESIRED_PREVIEW_SIZE;
-    }
-
-    // Which detection model to use: by default uses Tensorflow Object Detection API frozen
-    // checkpoints.
-    private enum DetectorMode {
-        TF_OD_API;
-    }
-
+    protected Size getDesiredPreviewFrameSize() { return DESIRED_PREVIEW_SIZE; }
+    
     @Override
-    protected void setUseNNAPI(final boolean isChecked) {
-        runInBackground(() -> detector.setUseNNAPI(isChecked));
+    protected void setUseNNAPI(boolean isChecked) {
+        if(detector != null) runInBackground(() -> detector.setUseNNAPI(isChecked));
+    }
+    @Override
+    protected void setNumThreads(int numThreads) {
+        if(detector != null) runInBackground(() -> detector.setNumThreads(numThreads));
     }
 
+    // This method is required by CameraActivity but not used in our voice-only app
     @Override
-    protected void setNumThreads(final int numThreads) {
-        runInBackground(() -> detector.setNumThreads(numThreads));
-    }
+    protected void updateActiveModel() {}
 }
